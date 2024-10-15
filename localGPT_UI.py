@@ -9,7 +9,8 @@ from langchain.chains import RetrievalQA
 from streamlit_extras.add_vertical_space import add_vertical_space
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
-
+from sentence_transformers import SentenceTransformer
+import os
 
 def model_memory():
     # Adding history to the model.
@@ -27,24 +28,13 @@ def model_memory():
 
     return prompt, memory
 
-
 # Sidebar contents
 with st.sidebar:
-    st.title("🤗💬 Converse with your Data")
-    st.markdown(
-        """
-    ## About
-    This app is an LLM-powered chatbot built using:
-    - [Streamlit](https://streamlit.io/)
-    - [LangChain](https://python.langchain.com/)
-    - [LocalGPT](https://github.com/PromtEngineer/localGPT) 
- 
-    """
-    )
+    st.title("Converse with your Data")
     add_vertical_space(5)
-    st.write("Made with ❤️ by [Prompt Engineer](https://youtube.com/@engineerprompt)")
+    st.write("Made with Lokesh")
 
-
+# Check for available device
 if torch.backends.mps.is_available():
     DEVICE_TYPE = "mps"
 elif torch.cuda.is_available():
@@ -52,71 +42,94 @@ elif torch.cuda.is_available():
 else:
     DEVICE_TYPE = "cpu"
 
+# Define document upload functionality
+uploaded_file = st.file_uploader("Upload a document", type=["pdf", "txt", "csv"])
 
-# if "result" not in st.session_state:
-#     # Run the document ingestion process.
-#     run_langest_commands = ["python", "ingest.py"]
-#     run_langest_commands.append("--device_type")
-#     run_langest_commands.append(DEVICE_TYPE)
+if uploaded_file is not None:
+    # Save the uploaded file temporarily
+    file_path = os.path.join(PERSIST_DIRECTORY, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-#     result = subprocess.run(run_langest_commands, capture_output=True)
-#     st.session_state.result = result
+    st.success(f"Uploaded {uploaded_file.name} successfully!")
 
-# Define the retreiver
-# load the vectorstore
+    # Process the document ingestion in the background
+    if "result" not in st.session_state:
+        run_langest_commands = ["python", "ingest.py", "--device_type", DEVICE_TYPE]
+        result = subprocess.run(run_langest_commands, capture_output=True)
+        st.session_state.result = result
+        st.success("Document ingestion completed!")
+
+# Initialize embeddings with error handling
 if "EMBEDDINGS" not in st.session_state:
-    EMBEDDINGS = HuggingFaceInstructEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={"device": DEVICE_TYPE})
-    st.session_state.EMBEDDINGS = EMBEDDINGS
+    try:
+        st.session_state.EMBEDDINGS = SentenceTransformer(EMBEDDING_MODEL_NAME, device=DEVICE_TYPE)
+    except Exception as e:
+        st.error(f"Failed to load embeddings model: {str(e)}")
 
-if "DB" not in st.session_state:
-    DB = Chroma(
-        persist_directory=PERSIST_DIRECTORY,
-        embedding_function=st.session_state.EMBEDDINGS,
-        client_settings=CHROMA_SETTINGS,
-    )
-    st.session_state.DB = DB
+# Initialize vector store with error handling
+if "DB" not in st.session_state and "EMBEDDINGS" in st.session_state:
+    try:
+        st.session_state.DB = Chroma(
+            persist_directory=PERSIST_DIRECTORY,
+            embedding_function=lambda x: st.session_state.EMBEDDINGS.encode(x),
+            client_settings=CHROMA_SETTINGS,
+        )
+    except Exception as e:
+        st.error(f"Failed to load vector store: {str(e)}")
 
-if "RETRIEVER" not in st.session_state:
-    RETRIEVER = DB.as_retriever()
-    st.session_state.RETRIEVER = RETRIEVER
+# Initialize retriever with error handling
+if "RETRIEVER" not in st.session_state and "DB" in st.session_state:
+    try:
+        st.session_state.RETRIEVER = st.session_state.DB.as_retriever()
+    except Exception as e:
+        st.error(f"Failed to initialize retriever: {str(e)}")
 
+# Load the language model (LLM) with error handling
 if "LLM" not in st.session_state:
-    LLM = load_model(device_type=DEVICE_TYPE, model_id=MODEL_ID, model_basename=MODEL_BASENAME)
-    st.session_state["LLM"] = LLM
+    try:
+        st.session_state["LLM"] = load_model(device_type=DEVICE_TYPE, model_id=MODEL_ID, model_basename=MODEL_BASENAME)
+    except Exception as e:
+        st.error(f"Failed to load LLM: {str(e)}")
 
+# Initialize the QA system with error handling
+if "QA" not in st.session_state and "LLM" in st.session_state and "RETRIEVER" in st.session_state:
+    try:
+        prompt, memory = model_memory()
+        st.session_state["QA"] = RetrievalQA.from_chain_type(
+            llm=st.session_state["LLM"],
+            chain_type="stuff",
+            retriever=st.session_state.RETRIEVER,
+            return_source_documents=True,
+            chain_type_kwargs={"prompt": prompt, "memory": memory},
+        )
+    except Exception as e:
+        st.error(f"Failed to initialize QA system: {str(e)}")
 
-if "QA" not in st.session_state:
-    prompt, memory = model_memory()
+# Main app
+st.title("LocalGPT App")
 
-    QA = RetrievalQA.from_chain_type(
-        llm=LLM,
-        chain_type="stuff",
-        retriever=RETRIEVER,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt, "memory": memory},
-    )
-    st.session_state["QA"] = QA
-
-st.title("LocalGPT App 💬")
 # Create a text input box for the user
-prompt = st.text_input("Input your prompt here")
-# while True:
+user_prompt = st.text_input("Input your prompt here")
 
 # If the user hits enter
-if prompt:
-    # Then pass the prompt to the LLM
-    response = st.session_state["QA"](prompt)
-    answer, docs = response["result"], response["source_documents"]
-    # ...and write it out to the screen
-    st.write(answer)
+if user_prompt:
+    # Process the user's prompt
+    if "QA" in st.session_state:
+        try:
+            response = st.session_state["QA"](user_prompt)
+            answer, docs = response["result"], response["source_documents"]
+            st.write(answer)
 
-    # With a streamlit expander
-    with st.expander("Document Similarity Search"):
-        # Find the relevant pages
-        search = st.session_state.DB.similarity_search_with_score(prompt)
-        # Write out the first
-        for i, doc in enumerate(search):
-            # print(doc)
-            st.write(f"Source Document # {i+1} : {doc[0].metadata['source'].split('/')[-1]}")
-            st.write(doc[0].page_content)
-            st.write("--------------------------------")
+            # Show the source documents with similarity scores
+            with st.expander("Document Similarity Search"):
+                if "DB" in st.session_state:
+                    search = st.session_state.DB.similarity_search_with_score(user_prompt)
+                    for i, doc in enumerate(search):
+                        st.write(f"Source Document # {i+1} : {doc[0].metadata['source'].split('/')[-1]}")
+                        st.write(doc[0].page_content)
+                        st.write("--------------------------------")
+        except Exception as e:
+            st.error(f"Failed to process the prompt: {str(e)}")
+    else:
+        st.error("QA system is not initialized.")
